@@ -15,44 +15,56 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-    - uses: actions/checkout@722adc63f1aa60a57ec37892e133b1d319cae598
+    - id: checkout
+      uses: actions/checkout@722adc63f1aa60a57ec37892e133b1d319cae598
       # SECURITY ISSUE: Not pinning action version with SHA
       # Pinned to commit SHA per requirement
     
-    - name: Set up Python
+    - id: setup-python
+      name: Set up Python
       uses: actions/setup-python@e9aba2c848f5ebd159c070c61ea2c4e2b122355e
       # SECURITY ISSUE: Not pinning action version with SHA
       # Pinned to commit SHA per requirement
       with:
         python-version: '3.9'
     
-    - name: Install dependencies
+    - id: install-deps
+      name: Install dependencies
+      if: ${{ always() && steps["setup-python"].conclusion == 'success' }}
       run: |
         python -m pip install --upgrade pip
         if [ -f app/requirements.txt ]; then pip install -r app/requirements.txt; fi
-        pip install pytest
-    
-    - name: Run tests
+
+    - id: run-tests
+      name: Run tests
+      if: ${{ always() && steps["install-deps"].conclusion == 'success' }}
       run: |
+        pip install pytest
         pytest app/
     
     # SECURITY ISSUE: No SAST scan
     # Running security tests
-    - name: SAST scan (Bandit)
+    - id: sast
+      name: SAST scan (Bandit)
+      if: ${{ always() && steps["install-deps"].conclusion == 'success' }}
       run: |
         pip install bandit
         bandit -r app -ll
 
     # SECURITY ISSUE: No dependency scanning
     # Dependency Scanning
-    - name: Dependency scan (Safety)
+    - id: safety
+      name: Dependency scan (Safety)
+      if: ${{ always() && steps["install-deps"].conclusion == 'success' }}
       run: |
         pip install safety
         if [ -f app/requirements.txt ]; then safety check -r app/requirements.txt --full-report; else echo "No requirements.txt found"; fi
 
     # SECURITY ISSUE: No secrets scanning
     # Secrets Scanning
-    - name: Secrets scan (Gitleaks)
+    - id: gitleaks
+      name: Secrets scan (Gitleaks)
+      if: ${{ always() && steps["checkout"].conclusion == 'success' }}
       run: |
         GITLEAKS_VERSION=8.18.4
         curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz -o gitleaks.tar.gz
@@ -60,35 +72,45 @@ jobs:
         chmod +x gitleaks
         ./gitleaks detect -v --redact --exit-code 1
     
-    - name: Build Docker image
+    - id: docker-build
+      name: Build Docker image
+      if: ${{ always() && steps["checkout"].conclusion == 'success' }}
       run: |
         docker build -t user-management:${{ github.sha }} app/
 
     # SECURITY ISSUE: Not scanning the Docker image for vulnerabilities
     # Container Image Scanning
-    - name: Container scan (Trivy)
+    - id: trivy
+      name: Container scan (Trivy)
+      if: ${{ always() && steps["docker-build"].conclusion == 'success' }}
       run: |
         curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
         trivy image --exit-code 1 --severity HIGH,CRITICAL --no-progress user-management:${{ github.sha }}
     
     # IaC Scanning
-    - name: IaC scan (Checkov)
+    - id: checkov
+      name: IaC scan (Checkov)
+      if: ${{ always() && steps["install-deps"].conclusion == 'success' }}
       run: |
         pip install checkov
         checkov -d infra --framework terraform,kubernetes
     
     
-    - name: Configure AWS credentials (OIDC)
+    - id: configure-aws
+      name: Configure AWS credentials (OIDC)
+      if: always()
       uses: aws-actions/configure-aws-credentials@v4
       with:
         role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
         aws-region: us-west-2
     
-    - name: Login to Amazon ECR
-      id: login-ecr
+    - id: login-ecr
+      name: Login to Amazon ECR
+      if: ${{ always() && steps["configure-aws"].conclusion == 'success' }}
       uses: aws-actions/amazon-ecr-login@v1
     
     - name: Push image to Amazon ECR
+      if: ${{ always() && steps["login-ecr"].conclusion == 'success' && steps["docker-build"].conclusion == 'success' }}
       env:
         ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         ECR_REPOSITORY: user-management
@@ -99,31 +121,42 @@ jobs:
 
   deploy:
     needs: build
+    if: always()
     runs-on: ubuntu-latest
     # SECURITY ISSUE: No environment-specific deployment
     # SECURITY ISSUE: No approval gate for production deployment
     environment: production
     
     steps:
-    - uses: actions/checkout@v2
+    - id: deploy-checkout
+      uses: actions/checkout@v2
+      if: always()
     
-    - name: Configure AWS credentials (OIDC)
+    - id: deploy-configure-aws
+      name: Configure AWS credentials (OIDC)
+      if: always()
       uses: aws-actions/configure-aws-credentials@v4
       with:
         role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
         aws-region: us-west-2
     
-    - name: Update kubeconfig
+    - id: update-kubeconfig
+      name: Update kubeconfig
+      if: ${{ always() && steps["deploy-configure-aws"].conclusion == 'success' }}
       run: |
         aws eks update-kubeconfig --name my-cluster --region us-west-2
     
     # SECURITY ISSUE: No validation of Kubernetes manifests
     # Validation of Kubernetes manifests
-    - name: Validate Kubernetes manifests (server-side dry-run)
+    - id: validate-manifests
+      name: Validate Kubernetes manifests (server-side dry-run)
+      if: ${{ always() && steps["update-kubeconfig"].conclusion == 'success' }}
       run: |
         kubectl apply --dry-run=server -f infra/deployment.yaml
     
-    - name: Deploy to Kubernetes
+    - id: deploy-kubernetes
+      name: Deploy to Kubernetes
+      if: ${{ always() && steps["update-kubeconfig"].conclusion == 'success' }}
       run: |
         kubectl apply -f infra/deployment.yaml
         # SECURITY ISSUE: No rollback strategy
@@ -140,6 +173,7 @@ jobs:
     - name: DAST scan (OWASP ZAP baseline)
       env:
         TARGET_URL: ${{ secrets.DAST_TARGET_URL }}
+      if: always()
       run: |
         if [ -z "$TARGET_URL" ]; then echo "Skipping DAST: DAST_TARGET_URL not set"; exit 0; fi
         docker run --rm -t owasp/zap2docker-stable zap-baseline.py -t "$TARGET_URL" -r zap-baseline.html -m 5 -I || true
@@ -154,6 +188,7 @@ jobs:
     # SECURITY ISSUE: No compliance validation
     # Compliance Validation
     - name: Compliance validation
+      if: always()
       run: |
         python3 -m pip install --user pyyaml
         python3 security/compliance_check.py --k8s-namespace default --terraform-dir infra --dockerfile app/Dockerfile --output text > compliance.txt
