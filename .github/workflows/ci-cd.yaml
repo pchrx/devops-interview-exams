@@ -6,17 +6,23 @@ on:
   pull_request:
     branches: [ main ]
 
+permissions:
+  contents: read
+  id-token: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
     
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@722adc63f1aa60a57ec37892e133b1d319cae598
       # SECURITY ISSUE: Not pinning action version with SHA
+      # Pinned to commit SHA per requirement
     
     - name: Set up Python
-      uses: actions/setup-python@v2
+      uses: actions/setup-python@e9aba2c848f5ebd159c070c61ea2c4e2b122355e
       # SECURITY ISSUE: Not pinning action version with SHA
+      # Pinned to commit SHA per requirement
       with:
         python-version: '3.9'
     
@@ -28,24 +34,54 @@ jobs:
     
     - name: Run tests
       run: |
-        # SECURITY ISSUE: Not running security tests
         pytest app/
+    
+    # SECURITY ISSUE: No SAST scan
+    # Running security tests
+    - name: SAST scan (Bandit)
+      run: |
+        pip install bandit
+        bandit -r app -ll
+
+    # SECURITY ISSUE: No dependency scanning
+    # Dependency Scanning
+    - name: Dependency scan (Safety)
+      run: |
+        pip install safety
+        if [ -f app/requirements.txt ]; then safety check -r app/requirements.txt --full-report; else echo "No requirements.txt found"; fi
+
+    # SECURITY ISSUE: No secrets scanning
+    # Secrets Scanning
+    - name: Secrets scan (Gitleaks)
+      run: |
+        GITLEAKS_VERSION=8.18.4
+        curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz -o gitleaks.tar.gz
+        tar -xzf gitleaks.tar.gz gitleaks
+        chmod +x gitleaks
+        ./gitleaks detect -v --redact --exit-code 1
     
     - name: Build Docker image
       run: |
         docker build -t user-management:${{ github.sha }} app/
-        # SECURITY ISSUE: Not scanning the Docker image for vulnerabilities
+
+    # SECURITY ISSUE: Not scanning the Docker image for vulnerabilities
+    # Container Image Scanning
+    - name: Container scan (Trivy)
+      run: |
+        curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+        trivy image --exit-code 1 --severity HIGH,CRITICAL --no-progress user-management:${{ github.sha }}
     
-    # SECURITY ISSUE: No SAST scan
-    # SECURITY ISSUE: No dependency scanning
-    # SECURITY ISSUE: No secrets scanning
+    # IaC Scanning
+    - name: IaC scan (Checkov)
+      run: |
+        pip install checkov
+        checkov -d infra --framework terraform,kubernetes
     
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v1
+    
+    - name: Configure AWS credentials (OIDC)
+      uses: aws-actions/configure-aws-credentials@v4
       with:
-        # SECURITY ISSUE: Hardcoded credentials
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
         aws-region: us-west-2
     
     - name: Login to Amazon ECR
@@ -58,37 +94,74 @@ jobs:
         ECR_REPOSITORY: user-management
       run: |
         docker tag user-management:${{ github.sha }} $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}
-        docker tag user-management:${{ github.sha }} $ECR_REGISTRY/$ECR_REPOSITORY:latest
         docker push $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}
-        docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
-        # SECURITY ISSUE: Pushing latest tag
+        # SECURITY ISSUE: Pushing latest tag (removed)
 
   deploy:
     needs: build
     runs-on: ubuntu-latest
     # SECURITY ISSUE: No environment-specific deployment
     # SECURITY ISSUE: No approval gate for production deployment
+    environment: production
     
     steps:
     - uses: actions/checkout@v2
     
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v1
+    - name: Configure AWS credentials (OIDC)
+      uses: aws-actions/configure-aws-credentials@v4
       with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
         aws-region: us-west-2
     
     - name: Update kubeconfig
       run: |
         aws eks update-kubeconfig --name my-cluster --region us-west-2
     
+    # SECURITY ISSUE: No validation of Kubernetes manifests
+    # Validation of Kubernetes manifests
+    - name: Validate Kubernetes manifests (server-side dry-run)
+      run: |
+        kubectl apply --dry-run=server -f infra/deployment.yaml
+    
     - name: Deploy to Kubernetes
       run: |
-        # SECURITY ISSUE: No validation of Kubernetes manifests
         kubectl apply -f infra/deployment.yaml
         # SECURITY ISSUE: No rollback strategy
         # SECURITY ISSUE: No verification of deployment health
+        # Verify rollout and rollback on failure
+        if ! kubectl rollout status deployment/app-deployment --timeout=120s; then
+          echo "Deployment rollout failed, performing rollback"
+          kubectl rollout undo deployment/app-deployment || true
+          exit 1
+        fi
     
     # SECURITY ISSUE: No DAST scanning post-deployment
+    # DAST Scanning
+    - name: DAST scan (OWASP ZAP baseline)
+      env:
+        TARGET_URL: ${{ secrets.DAST_TARGET_URL }}
+      run: |
+        if [ -z "$TARGET_URL" ]; then echo "Skipping DAST: DAST_TARGET_URL not set"; exit 0; fi
+        docker run --rm -t owasp/zap2docker-stable zap-baseline.py -t "$TARGET_URL" -r zap-baseline.html -m 5 -I || true
+    
+    - name: Upload ZAP report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: zap-baseline-report
+        path: zap-baseline.html
+
     # SECURITY ISSUE: No compliance validation
+    # Compliance Validation
+    - name: Compliance validation
+      run: |
+        python3 -m pip install --user pyyaml
+        python3 security/compliance_check.py --k8s-namespace default --terraform-dir infra --dockerfile app/Dockerfile --output text > compliance.txt
+        if grep -q "Total Issues: 0" compliance.txt; then echo "Compliance passed"; else echo "Compliance violations found"; exit 1; fi
+
+    - name: Upload compliance report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: compliance-report
+        path: compliance.txt

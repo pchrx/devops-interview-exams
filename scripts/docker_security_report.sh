@@ -63,13 +63,38 @@ else
 fi
 
 # Check for environment variables with sensitive names
-ENV_VARS=$(docker inspect --format='{{range .Config.Env}}{{.}} {{end}}' $IMAGE_NAME)
+ENV_VARS=$(docker inspect --format='{{range .Config.Env}}{{.}} {{end}}' "$IMAGE_NAME")
 if [ -n "$ENV_VARS" ]; then
-    echo "[INFO] Environment variables found"
-    
-    # Check for sensitive environment variables
-    if [[ $ENV_VARS == *"PASSWORD"* ]] || [[ $ENV_VARS == *"SECRET"* ]] || [[ $ENV_VARS == *"KEY"* ]]; then
-        echo "[HIGH] Potentially sensitive information in environment variables"
+    echo "[INFO] Environment variables found in image config"
+
+    # Show env keys (names only) from image config
+    echo "[INFO] Env keys (image config):"
+    echo "$ENV_VARS" | tr ' ' '\n' | sed -e '/^$/d' -e 's/=.*//' | sort -u | sed 's/^/  - /'
+
+    # Show env keys at runtime using a temporary container (do not run the app)
+    RUNTIME_ENV=$(docker run --rm --entrypoint env "$IMAGE_NAME" 2>/dev/null || true)
+    if [ -n "$RUNTIME_ENV" ]; then
+        echo "[INFO] Env keys (runtime):"
+        echo "$RUNTIME_ENV" | sed -e 's/=.*//' | sort -u | sed 's/^/  - /'
+    fi
+
+    # More precise sensitive-name check to reduce false positives (e.g., GPG_KEY)
+    SENSITIVE_PATTERN='(^|_)(AWS_SECRET_ACCESS_KEY|AWS_ACCESS_KEY_ID|API_KEY|PRIVATE_KEY|PASSWORD|DB_PASSWORD|SECRET|TOKEN|CREDENTIALS)='
+
+    # Image config matches
+    MATCHES_IMG=$(echo "$ENV_VARS" | tr ' ' '\n' | grep -E "$SENSITIVE_PATTERN" | sed 's/=.*//' | sort -u || true)
+    if [ -n "$MATCHES_IMG" ]; then
+        echo "[HIGH] Potentially sensitive env vars (image config):"
+        echo "$MATCHES_IMG" | sed 's/^/  - /'
+    fi
+
+    # Runtime matches
+    if [ -n "$RUNTIME_ENV" ]; then
+        MATCHES_RT=$(echo "$RUNTIME_ENV" | grep -E "$SENSITIVE_PATTERN" | sed 's/=.*//' | sort -u || true)
+        if [ -n "$MATCHES_RT" ]; then
+            echo "[HIGH] Potentially sensitive env vars (runtime):"
+            echo "$MATCHES_RT" | sed 's/^/  - /'
+        fi
     fi
 fi
 
